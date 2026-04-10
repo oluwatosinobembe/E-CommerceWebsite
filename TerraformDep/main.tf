@@ -329,26 +329,17 @@ resource "helm_release" "load_balancer_controller" {
     namespace  = "kube-system"
     timeout    = 600  # Increased timeout to 10 minutes
     wait       = true
-    set {
-        name  = "clusterName"
-        value = var.cluster_name
-    }
-    set {
-        name  = "serviceAccount.create"
-        value = "false"
-    }
-    set {
-        name  = "serviceAccount.name"
-        value = "aws-load-balancer-controller"
-    }
-    set {
-        name  = "region"
-        value = var.region
-    }
-    set {
-        name  = "vpcId"
-        value = aws_vpc.main.id
-    }
+    values     = [
+        yamlencode({
+            clusterName = var.cluster_name
+            serviceAccount = {
+                create = false
+                name   = "aws-load-balancer-controller"
+            }
+            region = var.region
+            vpcId  = aws_vpc.main.id
+        })
+    ]
     depends_on = [
         kubernetes_service_account.load_balancer_controller,
         aws_eks_node_group.node_group
