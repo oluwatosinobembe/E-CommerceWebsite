@@ -30,7 +30,6 @@ pipeline {
             }
             steps {
                 script {
-                    // Fix operator precedence
                     if (!(params.AWS_ACCOUNT_ID ==~ /\d{12}/)) {
                         error "AWS_ACCOUNT_ID must be a 12-digit number"
                     }
@@ -118,16 +117,13 @@ pipeline {
                         sh "docker run -d ${hostPort} --name ${containerName} ${env.DOCKER_IMAGE}"
                         sh "sleep 5"
 
-                        // Check if container is running
                         sh "docker ps | grep ${containerName}"
 
-                        // Check index.html (main page)
                         def indexResponse = sh(script: "curl -s -o /dev/null -w '%{http_code}' http://localhost:${testPort == 0 ? '80' : testPort}/index.html", returnStdout: true).trim()
                         if (indexResponse != '200') {
                             error "Failed to load index.html: HTTP ${indexResponse}"
                         }
 
-                        // Alternative: Check root path
                         def rootResponse = sh(script: "curl -s -o /dev/null -w '%{http_code}' http://localhost:${testPort == 0 ? '80' : testPort}/", returnStdout: true).trim()
                         if (rootResponse != '200') {
                             error "Failed to load root page: HTTP ${rootResponse}"
@@ -175,28 +171,65 @@ pipeline {
             steps {
                 script {
                     writeFile file: 'TerraformDep/terraform.tfvars', text: """
-ecr_image_uri = "${env.DOCKER_IMAGE}"
-cluster_name  = "${env.CLUSTER_NAME}"
-region        = "${params.AWS_REGION}"
-service_type  = "LoadBalancer"
+ecr_image_uri  = "${env.DOCKER_IMAGE}"
+cluster_name   = "${env.CLUSTER_NAME}"
+region         = "${params.AWS_REGION}"
+service_type   = "LoadBalancer"
 aws_account_id = "${env.AWS_ACCOUNT_ID}"
 """
                 }
             }
         }
 
-        stage('Apply Terraform Changes') {
+        stage('Apply Terraform - Infrastructure') {
             when {
                 expression { !params.DESTROY }
             }
             steps {
-                dir('TerraformDep') {
-                    script {
+                script {
+                    dir('TerraformDep') {
                         withAWS(credentials: 'access-key', region: "${params.AWS_REGION}") {
                             sh 'terraform init'
                             sh 'terraform workspace select dev || terraform workspace new dev'
-                            sh 'terraform plan -out=tfplan'
-                            sh 'terraform apply -auto-approve tfplan'
+                            sh '''
+                                terraform apply -auto-approve \
+                                    -target=aws_vpc.main \
+                                    -target=aws_subnet.public \
+                                    -target=aws_internet_gateway.igw \
+                                    -target=aws_route_table.public \
+                                    -target=aws_route_table_association.public \
+                                    -target=aws_iam_role.eks_cluster \
+                                    -target=aws_iam_role_policy_attachment.eks_cluster_policy \
+                                    -target=aws_iam_role.eks_nodes \
+                                    -target=aws_iam_role_policy_attachment.eks_worker_node_policy \
+                                    -target=aws_iam_role_policy_attachment.eks_cni_policy \
+                                    -target=aws_iam_role_policy_attachment.ecr_read_only \
+                                    -target=aws_security_group.eks_nodes_sg \
+                                    -target=aws_security_group.alb_sg \
+                                    -target=aws_eks_cluster.eks_cluster \
+                                    -target=aws_eks_node_group.node_group \
+                                    -target=aws_iam_policy.load_balancer_controller \
+                                    -target=aws_iam_role.load_balancer_controller \
+                                    -target=aws_iam_role_policy_attachment.load_balancer_controller \
+                                    -target=kubernetes_service_account.load_balancer_controller \
+                                    -target=helm_release.load_balancer_controller \
+                                    -target=time_sleep.wait_for_lb_controller
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Apply Terraform - App Deployment') {
+            when {
+                expression { !params.DESTROY }
+            }
+            steps {
+                script {
+                    dir('TerraformDep') {
+                        withAWS(credentials: 'access-key', region: "${params.AWS_REGION}") {
+                            sh 'terraform apply -auto-approve'
                         }
                     }
                 }
@@ -208,8 +241,8 @@ aws_account_id = "${env.AWS_ACCOUNT_ID}"
                 expression { params.DESTROY }
             }
             steps {
-                dir('TerraformDep') {
-                    script {
+                script {
+                    dir('TerraformDep') {
                         withAWS(credentials: 'access-key', region: "${params.AWS_REGION}") {
                             writeFile file: 'terraform.tfvars', text: """
 ecr_image_uri  = "205930632952.dkr.ecr.us-west-2.amazonaws.com/projectme-ak:latest"
@@ -220,12 +253,8 @@ aws_account_id = "${params.AWS_ACCOUNT_ID}"
 """
                             sh 'terraform init'
                             sh 'terraform workspace select dev || true'
-
-                            // Try to destroy Kubernetes resources first (ignore failures)
                             sh 'terraform destroy -target=kubernetes_deployment.app -auto-approve || true'
                             sh 'terraform destroy -target=kubernetes_service_account.load_balancer_controller -auto-approve || true'
-
-                            // Then destroy everything else
                             sh 'terraform destroy -auto-approve'
                         }
                     }
@@ -235,37 +264,36 @@ aws_account_id = "${params.AWS_ACCOUNT_ID}"
     }
 
     post {
-        always {
+        failure {
             script {
                 if (!params.DESTROY) {
-                    // Simplified cleanup: avoid bad substitution / xargs issues
-                    sh """
-                      docker system prune -f || true
-                      for cid in \$(docker ps -q --filter "name=test-container-${BUILD_NUMBER}"); do
-                        docker stop "\$cid" || true
-                      done
-                      for cid in \$(docker ps -a -q --filter "name=test-container-${BUILD_NUMBER}"); do
-                        docker rm "\$cid" || true
-                      done
-                    """
+                    echo 'Pipeline failed. Attempting Terraform destroy to clean up resources...'
+                    dir('TerraformDep') {
+                        withAWS(credentials: 'access-key', region: "${params.AWS_REGION}") {
+                            sh 'terraform init && terraform destroy -auto-approve || true'
+                        }
+                    }
                 }
-                echo 'Cleaning up workspace.'
-                cleanWs()
+                echo 'Pipeline failed.'
             }
         }
         success {
             echo params.DESTROY ? 'Terraform destroy completed successfully.' : 'Pipeline completed successfully.'
         }
-        failure {
-            echo params.DESTROY ? 'Terraform destroy failed.' : 'Pipeline failed.'
+        always {
             script {
-                if (!params.DESTROY) {
-                    dir('TerraformDep') {
-                        // This will do nothing if files are gone, but will not break the build
-                        sh 'terraform init && terraform destroy -auto-approve || true'
-                    }
-                }
+                sh """
+                  docker system prune -f || true
+                  for cid in \$(docker ps -q --filter "name=test-container-${BUILD_NUMBER}"); do
+                    docker stop "\$cid" || true
+                  done
+                  for cid in \$(docker ps -a -q --filter "name=test-container-${BUILD_NUMBER}"); do
+                    docker rm "\$cid" || true
+                  done
+                """
             }
+            echo 'Cleaning up workspace.'
+            cleanWs()
         }
     }
 }
