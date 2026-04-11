@@ -13,10 +13,6 @@ terraform {
             source  = "hashicorp/helm"
             version = "~> 2.0"
         }
-        time = {
-            source = "hashicorp/time"
-            version = "~> 0.9" 
-        }
     }
     backend "s3" {
         bucket         = "ecommerce-terraform-state-485783352323"
@@ -274,8 +270,7 @@ resource "kubernetes_service" "app_service" {
         type = var.service_type
     }
     depends_on = [
-        kubernetes_deployment.app,
-        time_sleep.wait_for_lb_controller
+        kubernetes_deployment.app
     ]
 }
 
@@ -329,26 +324,30 @@ resource "helm_release" "load_balancer_controller" {
     namespace  = "kube-system"
     timeout    = 600  # Increased timeout to 10 minutes
     wait       = true
-    values     = [
-        yamlencode({
-            clusterName = var.cluster_name
-            serviceAccount = {
-                create = false
-                name   = "aws-load-balancer-controller"
-            }
-            region = var.region
-            vpcId  = aws_vpc.main.id
-        })
-    ]
+    set {
+        name  = "clusterName"
+        value = var.cluster_name
+    }
+    set {
+        name  = "serviceAccount.create"
+        value = "false"
+    }
+    set {
+        name  = "serviceAccount.name"
+        value = "aws-load-balancer-controller"
+    }
+    set {
+        name  = "region"
+        value = var.region
+    }
+    set {
+        name  = "vpcId"
+        value = aws_vpc.main.id
+    }
     depends_on = [
         kubernetes_service_account.load_balancer_controller,
         aws_eks_node_group.node_group
     ]
-}
-
-resource "time_sleep" "wait_for_lb_controller" {
-  depends_on      = [helm_release.load_balancer_controller]
-  create_duration = "60s"
 }
 
 # Data source for availability zones
