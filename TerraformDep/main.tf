@@ -21,6 +21,10 @@ terraform {
             source  = "hashicorp/tls"
             version = "~> 4.0"
         }
+        null = {
+            source  = "hashicorp/null"
+            version = "~> 3.0"
+        }
     }
     backend "s3" {
         bucket       = "ecommerce-terraform-state-485783352323"
@@ -29,6 +33,7 @@ terraform {
         use_lockfile = true
     }
 }
+
 
 # AWS provider configuration
 provider "aws" {
@@ -281,6 +286,23 @@ resource "kubernetes_deployment" "app" {
     ]
 }
 
+
+# Restart LB controller after OIDC provider changes to pick up new credentials
+resource "null_resource" "restart_lb_controller" {
+    triggers = {
+        oidc_provider_arn = aws_iam_openid_connect_provider.eks.arn
+    }
+
+    provisioner "local-exec" {
+        command = "aws eks update-kubeconfig --name ${var.cluster_name} --region ${var.region} && kubectl rollout restart deployment aws-load-balancer-controller -n kube-system"
+    }
+
+    depends_on = [
+        aws_iam_openid_connect_provider.eks,
+        helm_release.load_balancer_controller
+    ]
+}
+
 # Kubernetes service with LoadBalancer
 resource "kubernetes_service" "app_service" {
     metadata {
@@ -299,7 +321,8 @@ resource "kubernetes_service" "app_service" {
     }
     depends_on = [
         kubernetes_deployment.app,
-        helm_release.load_balancer_controller
+        helm_release.load_balancer_controller,
+        null_resource.restart_lb_controller
     ]
 }
 
